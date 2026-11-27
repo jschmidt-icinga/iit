@@ -36,6 +36,11 @@
     (should (equal (caar response) 'results))
     (should (equal (alist-get 'code (cadar response)) 200))))
 
+(defun api-object-exists-p (name &optional node)
+  "Return non-nil if the host with NAME exists in the memory of NODE."
+  (let ((response (iit-api-request 'GET node (concat "v1/objects/hosts/" (url-hexify-string name)))))
+    (alist-get 'results response)))
+
 (defun api-hosts-dir (node)
   "Return the TRAMP name of the directory with the API-created hosts of NODE."
   (let* ((api-path (iit-node-file node "/var/lib/icinga2/api/packages/_api/"))
@@ -44,6 +49,19 @@
                           (expand-file-name "active-stage" api-path))
                          (string-trim (buffer-string)))))
     (expand-file-name "conf.d/hosts/" (expand-file-name active-stage api-path))))
+
+(defun load-config (hosts services)
+  "Return config statements for HOSTS hosts with SERVICES services each.
+They do nothing but make loading the config, and thus a reload, take longer."
+  (let (forms)
+    (dotimes (h hosts)
+      (let ((host (format "load-host-%d" h)))
+        (push `(object Host ,host (check_command "dummy") (enable_active_checks nil)) forms)
+        (dotimes (s services)
+          (push `(object Service ,(format "load-service-%d" s)
+                         (host_name ,host) (check_command "dummy") (enable_active_checks nil))
+                forms))))
+    (nreverse forms)))
 
 ;;;; Unit tests for the test infrastructure
 
@@ -242,6 +260,77 @@ apply Notification \"mail\" to Host {
         ;; Now for the final test we check if the objects have been recreated.
         (check-host-files 'master-1 t)
         (check-host-files 'master-2 t)))))
+
+(ert-deftest api-object-delete-during-reload ()
+  "Test that objects deleted on one master while the other one reloads stay deleted.
+
+While a node reloads, its old worker keeps applying config updates from the
+cluster, but the new worker has already read its config and doesn't see them.
+Objects deleted in that window used to live on in the memory of the new worker
+without a config file (\"ghost objects\", case A of Icinga/icinga2#11181)."
+  :tags '(:cluster)
+  (iit-with-cluster ((master-1 :zone "master")
+                     ;; The large config makes master-2 take long enough to reload that many
+                     ;; deletions happen during the reload.
+                     (master-2 :zone "master"
+                               :files (("conf.d/load.conf" ,@(load-config 5000 5)))))
+    (let ((num-objects 300)
+          (num-deleted 0))
+      (cl-labels ((host-name (i)
+                    (format "test-host-%d" i))
+                  (last-host ()
+                    (host-name (1- num-objects)))
+                  (check-hosts (node)
+                    ;; Hosts below num-deleted must be gone, all others must still exist, both
+                    ;; in memory and as config files.
+                    (let ((dir (api-hosts-dir node)))
+                      (dotimes (i num-objects)
+                        (let ((exists-p (api-object-exists-p (host-name i) node))
+                              (file (expand-file-name (concat (host-name i) ".conf") dir)))
+                          (if (< i num-deleted)
+                              (progn
+                                (should-not exists-p)
+                                (should-not (file-exists-p file)))
+                            (should exists-p)
+                            (should (file-exists-p file))))))))
+        ;; We create a number of host objects on master-1 and wait until both masters have them.
+        (iit-log-mark)
+        (dotimes (i num-objects)
+          (api-create-object (host-name i) 'master-1))
+        (dolist (node '(master-1 master-2))
+          (iit-expect-log node (regexp-quote
+                                (format "Created and activated object '%s'" (last-host)))))
+        (check-hosts 'master-1)
+        (check-hosts 'master-2)
+
+        ;; Now we make master-2 reload and keep deleting hosts on master-1 until master-2's new
+        ;; worker has taken over.  Some of these deletions are applied by master-2's old worker
+        ;; after the new worker has already read its config.
+        (iit-log-mark 'master-1)
+        (iit-node-reload 'master-2)
+        (while (not (iit-node-reloaded-p 'master-2))
+          ;; If this fails, master-2 took longer to reload than expected.
+          (should (< num-deleted num-objects))
+          (api-delete-object (host-name num-deleted) 'master-1)
+          (setq num-deleted (1+ num-deleted))
+          (sleep-for 0.05))
+        (message "Deleted %d hosts while master-2 was reloading" num-deleted)
+
+        ;; If this fails, master-2 reloaded too fast for the test to be meaningful.
+        (should (>= num-deleted 20))
+
+        ;; Deletions that master-2's old worker didn't get anymore reach the new worker through
+        ;; the replay log after reconnecting.
+        (iit-expect-log 'master-1 (regexp-quote "Finished syncing endpoint 'master-2'"))
+        (iit-expect-log 'master-2 (regexp-quote
+                                   "Finished syncing runtime objects to endpoint 'master-1'."))
+        (iit-expect-log 'master-2 (regexp-quote
+                                   (format "Deleted object '%s' of type 'Host'"
+                                           (host-name (1- num-deleted)))))
+
+        ;; Check that the deleted hosts are gone and all others still exist on both masters.
+        (check-hosts 'master-1)
+        (check-hosts 'master-2)))))
 
 ;; With EMACS_TEST_JUNIT_REPORT set, ERT writes a JUnit report to iit.xml.  It finds this file
 ;; through `load-history', which Emacs only updates once the file is completely loaded.
