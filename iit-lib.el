@@ -540,6 +540,20 @@ Sets the log mark of each node to before the restart."
       (iit--forget-connections node)
       (iit-expect-log node iit-ready-regexp))))
 
+(defun iit-node-reload (&rest nodes)
+  "Send SIGHUP to NODES to make Icinga 2 reload its config, without waiting.
+Sets the log mark of each node to before the reload.  The old worker keeps
+running until the new one has loaded its config; once the new worker has taken
+over, it logs `iit-ready-regexp' again."
+  (let ((nodes (iit--nodes nodes)))
+    (apply #'iit-log-mark nodes)
+    (iit--log-action "Reloading" nodes)
+    (iit-podman "kill" "--signal" "HUP" (mapcar #'iit-node-container nodes))))
+
+(defun iit-node-reloaded-p (node)
+  "Return non-nil if the new worker of NODE has taken over since `iit-node-reload'."
+  (string-match-p iit-ready-regexp (iit-node-log node)))
+
 ;;;; Logs
 
 (defun iit-node-log-file (node)
