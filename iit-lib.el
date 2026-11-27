@@ -9,9 +9,14 @@
 ;; a CA and node certificates, the configuration for every node, a podman network and one container
 ;; per node.  Everything is removed again when the form exits.
 ;;
-;; Only rootless podman is supported.  Containers run with `--userns=keep-id' mapped to the icinga
-;; user, so every file the containers write into bind mounts belongs to the user running the tests
-;; and can be removed without `podman unshare'.
+;; Only rootless podman is supported.  Containers run as root with podman's default user namespace,
+;; where container root is the user running the tests, and Icinga 2 is told to stay root instead of
+;; switching to the icinga user.  So every file the containers write into bind mounts belongs to the
+;; user running the tests and can be removed without `podman unshare'.
+;;
+;; Mapping the icinga user with `--userns=keep-id:uid=...' would be the more obvious choice, but any
+;; non-default mapping makes podman create a chowned copy of the image.  On overlay over ZFS that
+;; copy can hang in the kernel, in an unkillable process that blocks podman until the next reboot.
 ;;
 ;; Per node, the following host directories (below `iit-node-dir') are bind-mounted:
 ;;
@@ -64,9 +69,6 @@ useful when running a single test.")
 
 (defvar iit-label "iit"
   "Label attached to all containers and networks, used to clean up leftovers.")
-
-(defvar iit-icinga-uid 5665
-  "UID and GID of the icinga user in the image.")
 
 (defvar iit-log-timeout 60
   "Default number of seconds `iit-expect-log' waits for a pattern.")
@@ -274,8 +276,10 @@ be passed as lists."
     (unless (zerop (process-exit-status proc))
       (error "`podman %s' failed (%s)" (string-join args " ") (process-exit-status proc)))))
 
-(defun iit--userns-args ()
-  (format "--userns=keep-id:uid=%d,gid=%d" iit-icinga-uid iit-icinga-uid))
+(defun iit--user-args ()
+  "Arguments that run a container, and Icinga 2 in it, as container root.
+See the commentary at the top of this file for why."
+  '("--user" "0:0" "--env" "ICINGA2_USER=root" "--env" "ICINGA2_GROUP=root"))
 
 (defvar iit--image-ready nil
   "Non-nil once `iit-image' has been built or found in this run.")
@@ -676,7 +680,7 @@ server goes away between requests, as it does when nodes are restarted."
         (names (mapcar #'iit-node-name (iit-cluster-nodes cluster))))
     (message "Generating certificates")
     (make-directory (expand-file-name "ca" pki) t)
-    (iit-podman "run" "--rm" "--label" iit-label (iit--userns-args)
+    (iit-podman "run" "--rm" "--label" iit-label (iit--user-args)
                   "-v" (concat pki ":/pki:z")
                   "-v" (concat pki "/ca:/data/var/lib/icinga2/ca:z")
                   "--entrypoint" "/bin/sh"
@@ -715,7 +719,7 @@ A relative HOST path is relative to the node's directory and created if needed."
                   "--network" (iit-cluster-network cluster)
                   "--network-alias" name
                   "--label" iit-label
-                  (iit--userns-args)
+                  (iit--user-args)
                   "--stop-timeout" iit-stop-timeout
                   "-p" (format "127.0.0.1:%s:5665" (or (iit-node-port node) ""))
                   "-v" (concat (iit-node-dir node "etc") ":/data/etc/icinga2:z")
