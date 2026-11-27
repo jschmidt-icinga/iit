@@ -36,6 +36,15 @@
     (should (equal (caar response) 'results))
     (should (equal (alist-get 'code (cadar response)) 200))))
 
+(defun api-hosts-dir (node)
+  "Return the TRAMP name of the directory with the API-created hosts of NODE."
+  (let* ((api-path (iit-node-file node "/var/lib/icinga2/api/packages/_api/"))
+         (active-stage (with-temp-buffer
+                         (insert-file-contents-literally
+                          (expand-file-name "active-stage" api-path))
+                         (string-trim (buffer-string)))))
+    (expand-file-name "conf.d/hosts/" (expand-file-name active-stage api-path))))
+
 ;;;; Unit tests for the test infrastructure
 
 (ert-deftest config-render-object ()
@@ -160,16 +169,8 @@ apply Notification \"mail\" to Host {
                     (format "test-host-%d" i))
                   (last-host ()
                     (host-name (1- num-objects)))
-                  (hosts-dir (node)
-                    (let* ((api-path (iit-node-file node "/var/lib/icinga2/api/packages/_api/"))
-                           (active-stage (with-temp-buffer
-                                           (insert-file-contents-literally
-                                            (expand-file-name "active-stage" api-path))
-                                           (string-trim (buffer-string)))))
-                      (expand-file-name "conf.d/hosts/"
-                                        (expand-file-name active-stage api-path))))
                   (check-host-files (node exist)
-                    (let ((dir (hosts-dir node)))
+                    (let ((dir (api-hosts-dir node)))
                       (dotimes (i num-objects)
                         (let ((file (expand-file-name (concat (host-name i) ".conf") dir)))
                           (if exist
