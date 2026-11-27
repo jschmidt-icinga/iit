@@ -36,6 +36,20 @@ For services, NAME is the full name \"HOST!SERVICE\"."
     (should (equal (caar response) 'results))
     (should (equal (alist-get 'code (cadar response)) 200))))
 
+(defun api-modify-object (type name attrs &optional node)
+  "Set ATTRS, an alist, on the object of TYPE with NAME through the API of NODE."
+  (let ((response (iit-api-request 'POST node (api-object-path type name)
+                                   `((attrs . ,attrs)))))
+    (should (equal (caar response) 'results))
+    (should (equal (alist-get 'code (cadar response)) 200))))
+
+(defun api-object-attr (type name attr &optional node)
+  "Return the value of ATTR (a symbol) of the object of TYPE with NAME.
+The value is the one in the memory of NODE."
+  (let ((response (iit-api-request 'GET node (format "%s?attrs=%s" (api-object-path type name)
+                                                     attr))))
+    (alist-get attr (alist-get 'attrs (car (alist-get 'results response))))))
+
 (defun api-object-exists-p (type name &optional node)
   "Return non-nil if the object of TYPE with NAME exists in the memory of NODE."
   (let ((response (iit-api-request 'GET node (api-object-path type name))))
@@ -57,6 +71,14 @@ For services, NAME is the full name \"HOST!SERVICE\"."
 (defun api-delete-host (name &optional node)
   "Delete the host with NAME through the API of NODE."
   (api-delete-object 'host name node))
+
+(defun api-modify-host (name attrs &optional node)
+  "Set ATTRS, an alist, on the host with NAME through the API of NODE."
+  (api-modify-object 'host name attrs node))
+
+(defun api-host-attr (name attr &optional node)
+  "Return the value of ATTR (a symbol) of the host with NAME in the memory of NODE."
+  (api-object-attr 'host name attr node))
 
 (defun api-host-exists-p (name &optional node)
   "Return non-nil if the host with NAME exists in the memory of NODE."
@@ -337,6 +359,82 @@ service whose host was deleted, the next reload failed validation instead
         (iit-node-reload 'master-2)
         (iit-expect-log 'master-2 iit-ready-regexp)
         (check-no-test-objects 'master-2)))))
+
+(ert-deftest api-object-modify-during-reload ()
+  "Test that objects created and modified while a master reloads keep the changes.
+
+While a node reloads, its old worker keeps applying config updates from the
+cluster, but the new worker has already read its config and doesn't see them.
+An object created in that window doesn't exist in the memory of the new worker.
+When the new worker then gets an update for it, it creates the object from its
+config, but used to discard the modified attributes that came with the update.
+The object then kept its initial attributes, even after the next reload (case E
+of Icinga/icinga2#11181)."
+  :tags '(:cluster)
+  (iit-with-cluster ((master-1 :zone "master")
+                     ;; The large config makes master-2 take long enough to reload that many hosts
+                     ;; are created and modified during the reload.
+                     (master-2 :zone "master"
+                               :files (("conf.d/load.conf" ,@(load-config 5000 30)))))
+    (let ((num-hosts 300)
+          ;; Each host is modified this many iterations of the loop below after it was created,
+          ;; which is about one to two seconds.
+          (modify-lag 20)
+          (num-created 0)
+          (num-modified 0))
+      (cl-labels ((host-name (i)
+                    (format "test-host-%d" i))
+                  (display-name (i)
+                    (format "Modified test host %d" i))
+                  (modify-next-host ()
+                    (api-modify-host (host-name num-modified)
+                                     `((display_name . ,(display-name num-modified)))
+                                     'master-1)
+                    (setq num-modified (1+ num-modified)))
+                  (check-hosts (node)
+                    ;; All hosts that were created must have the modified display name.
+                    (dotimes (i num-created)
+                      (should (equal (api-host-attr (host-name i) 'display_name node)
+                                     (display-name i))))))
+        ;; We make master-2 reload and, until master-2's new worker has taken over, keep creating a
+        ;; host on master-1 and modifying it a little later.  Some hosts are created by master-2's
+        ;; old worker after the new worker has already read its config, and then modified on the
+        ;; new worker.
+        (iit-node-reload 'master-2)
+        (while (not (iit-node-reloaded-p 'master-2))
+          ;; If this fails, master-2 took longer to reload than expected.
+          (should (< num-created num-hosts))
+          (api-create-host (host-name num-created) 'master-1)
+          (setq num-created (1+ num-created))
+          (when (>= num-created modify-lag)
+            (modify-next-host))
+          (sleep-for 0.05))
+        (message "Created %d hosts while master-2 was reloading" num-created)
+
+        ;; If this fails, master-2 reloaded too fast for the test to be meaningful.
+        (should (>= (- num-created modify-lag) 20))
+
+        ;; Once master-2 has reconnected, we modify the remaining hosts.
+        (iit-expect-log 'master-1 (regexp-quote "Finished syncing endpoint 'master-2'"))
+        (iit-expect-log 'master-2 (regexp-quote
+                                   "Finished syncing runtime objects to endpoint 'master-1'."))
+        (while (< num-modified num-created)
+          (modify-next-host))
+
+        ;; Cluster messages are processed in order, so once master-2 has a host created after
+        ;; all modifications, it has processed the modifications as well.
+        (iit-log-mark 'master-2)
+        (api-create-host "sync-marker" 'master-1)
+        (iit-expect-log 'master-2 (regexp-quote "Created and activated object 'sync-marker'"))
+
+        ;; Check that the modifications have been applied on both masters.
+        (check-hosts 'master-1)
+        (check-hosts 'master-2)
+
+        ;; The modified attributes must survive the next reload of master-2 as well.
+        (iit-node-reload 'master-2)
+        (iit-expect-log 'master-2 iit-ready-regexp)
+        (check-hosts 'master-2)))))
 
 (provide 'iit-cluster)
 ;;; iit-cluster.el ends here
