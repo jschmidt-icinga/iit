@@ -25,8 +25,8 @@ jobs:
       - name: Byte-compile
         run: |
           emacs -Q --batch --eval '(setq byte-compile-error-on-warn t)' \
-            -f batch-byte-compile tests-lib.el tests.el
+            -f batch-byte-compile iit-lib.el iit.el
           rm -f *.elc
 
       - name: Run unit tests
-        run: ./tests.el '(tag :unit)'
+        run: ./iit.el '(tag :unit)'

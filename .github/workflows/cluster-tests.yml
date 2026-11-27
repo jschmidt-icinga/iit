@@ -33,9 +33,9 @@ jobs:
       - name: Check out the tests
         uses: actions/checkout@v5
         with:
-          path: config-sync-tests
+          path: iit
 
-      # tests.el uses ../icinga2 by default.
+      # iit.el uses ../icinga2 by default.
       - name: Check out Icinga 2
         uses: actions/checkout@v5
         with:
@@ -64,17 +64,17 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run tests
-        working-directory: config-sync-tests
+        working-directory: iit
         env:
           EMACS_TEST_JUNIT_REPORT: '1'
           SELECTOR: ${{ inputs.selector }}
-        run: ./tests.el --verbose ${SELECTOR:+"$SELECTOR"}
+        run: ./iit.el --verbose ${SELECTOR:+"$SELECTOR"}
 
       - name: Test report
         if: ${{ !cancelled() }}
         uses: mikepenz/action-junit-report@v5
         with:
-          report_paths: config-sync-tests/tests.xml
+          report_paths: iit/iit.xml
           annotate_only: true
           detailed_summary: true
           include_passed: true
