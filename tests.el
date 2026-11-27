@@ -242,4 +242,9 @@ apply Notification \"mail\" to Host {
         (check-host-files 'master-1 t)
         (check-host-files 'master-2 t)))))
 
+;; With EMACS_TEST_JUNIT_REPORT set, ERT writes a JUnit report to tests.xml.  It finds this file
+;; through `load-history', which Emacs only updates once the file is completely loaded.
+(when load-file-name
+  (push (cons load-file-name current-load-list) load-history))
+
 (ert-run-tests-batch-and-exit (tests-parse-command-line command-line-args-left))
