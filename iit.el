@@ -22,33 +22,70 @@
 
 ;;;; Helpers
 
-(defun api-create-object (name &optional node)
-  "Create a host with NAME through the API of NODE."
-  (let ((response (iit-api-request 'PUT node (concat "v1/objects/hosts/" (url-hexify-string name))
-                                     '((attrs . ((check_command . "dummy")))))))
+(defun api-object-path (type name)
+  "Return the API path of the object of TYPE (e.g. `host') with NAME.
+For services, NAME is the full name \"HOST!SERVICE\"."
+  (format "v1/objects/%ss/%s" type (url-hexify-string name)))
+
+(defun api-create-object (type name &optional node)
+  "Create an object of TYPE (e.g. `host') with NAME through the API of NODE."
+  (let ((response (iit-api-request 'PUT node (api-object-path type name)
+                                   '((attrs . ((check_command . "dummy")))))))
     (should (equal (caar response) 'results))
     (should (equal (alist-get 'code (cadar response)) 200))))
 
-(defun api-delete-object (name &optional node)
-  "Delete the host with NAME through the API of NODE."
-  (let ((response (iit-api-request 'DELETE node (concat "v1/objects/hosts/" (url-hexify-string name))
-                                     '((cascade . t)))))
+(defun api-delete-object (type name &optional node)
+  "Delete the object of TYPE (e.g. `host') with NAME through the API of NODE."
+  (let ((response (iit-api-request 'DELETE node (api-object-path type name)
+                                   '((cascade . t)))))
     (should (equal (caar response) 'results))
     (should (equal (alist-get 'code (cadar response)) 200))))
 
-(defun api-object-exists-p (name &optional node)
-  "Return non-nil if the host with NAME exists in the memory of NODE."
-  (let ((response (iit-api-request 'GET node (concat "v1/objects/hosts/" (url-hexify-string name)))))
+(defun api-object-exists-p (type name &optional node)
+  "Return non-nil if the object of TYPE with NAME exists in the memory of NODE."
+  (let ((response (iit-api-request 'GET node (api-object-path type name))))
     (alist-get 'results response)))
 
-(defun api-hosts-dir (node)
-  "Return the TRAMP name of the directory with the API-created hosts of NODE."
+(defun api-objects-dir (type node)
+  "Return the TRAMP name of the directory with API-created TYPE objects of NODE."
   (let* ((api-path (iit-node-file node "/var/lib/icinga2/api/packages/_api/"))
          (active-stage (with-temp-buffer
                          (insert-file-contents-literally
                           (expand-file-name "active-stage" api-path))
                          (string-trim (buffer-string)))))
-    (expand-file-name "conf.d/hosts/" (expand-file-name active-stage api-path))))
+    (expand-file-name (format "conf.d/%ss/" type) (expand-file-name active-stage api-path))))
+
+(defun api-create-host (name &optional node)
+  "Create a host with NAME through the API of NODE."
+  (api-create-object 'host name node))
+
+(defun api-delete-host (name &optional node)
+  "Delete the host with NAME through the API of NODE."
+  (api-delete-object 'host name node))
+
+(defun api-host-exists-p (name &optional node)
+  "Return non-nil if the host with NAME exists in the memory of NODE."
+  (api-object-exists-p 'host name node))
+
+(defun api-hosts-dir (node)
+  "Return the TRAMP name of the directory with the API-created hosts of NODE."
+  (api-objects-dir 'host node))
+
+(defun api-create-service (host name &optional node)
+  "Create a service with NAME on HOST through the API of NODE."
+  (api-create-object 'service (concat host "!" name) node))
+
+(defun api-delete-service (host name &optional node)
+  "Delete the service with NAME on HOST through the API of NODE."
+  (api-delete-object 'service (concat host "!" name) node))
+
+(defun api-service-exists-p (host name &optional node)
+  "Return non-nil if the service with NAME on HOST exists in the memory of NODE."
+  (api-object-exists-p 'service (concat host "!" name) node))
+
+(defun api-services-dir (node)
+  "Return the TRAMP name of the directory with the API-created services of NODE."
+  (api-objects-dir 'service node))
 
 (defun load-config (hosts services)
   "Return config statements for HOSTS hosts with SERVICES services each.
@@ -201,7 +238,7 @@ apply Notification \"mail\" to Host {
           ;; We create a number of host objects and check if they get synced to both masters
           ;; properly.
           (dotimes (i num-objects)
-            (api-create-object (host-name i) 'master-1))
+            (api-create-host (host-name i) 'master-1))
           (dolist (node '(master-1 master-2))
             (iit-expect-log node (regexp-quote
                                     (format "Created and activated object '%s'" (last-host)))))
@@ -215,7 +252,7 @@ apply Notification \"mail\" to Host {
           ;; With master-2 now unaware of what's going on, we delete the objects again via the API
           ;; and check that that has been properly executed.
           (dotimes (i num-objects)
-            (api-delete-object (host-name i) 'master-1))
+            (api-delete-host (host-name i) 'master-1))
           (iit-expect-log 'master-1 (regexp-quote
                                        (format "Deleted object '%s' of type 'Host'" (last-host))))
           (check-host-files 'master-1 nil)
@@ -246,7 +283,7 @@ apply Notification \"mail\" to Host {
         ;; We create a new set of objects on master-2 while master-1 is down.
         (iit-log-mark 'master-2)
         (dotimes (i num-objects)
-          (api-create-object (host-name i) 'master-2))
+          (api-create-host (host-name i) 'master-2))
         (iit-expect-log 'master-2 (regexp-quote
                                      (format "Created and activated object '%s'" (last-host))))
         (check-host-files 'master-2 t)
@@ -285,7 +322,7 @@ without a config file (\"ghost objects\", case A of Icinga/icinga2#11181)."
                     ;; in memory and as config files.
                     (let ((dir (api-hosts-dir node)))
                       (dotimes (i num-objects)
-                        (let ((exists-p (api-object-exists-p (host-name i) node))
+                        (let ((exists-p (api-host-exists-p (host-name i) node))
                               (file (expand-file-name (concat (host-name i) ".conf") dir)))
                           (if (< i num-deleted)
                               (progn
@@ -296,7 +333,7 @@ without a config file (\"ghost objects\", case A of Icinga/icinga2#11181)."
         ;; We create a number of host objects on master-1 and wait until both masters have them.
         (iit-log-mark)
         (dotimes (i num-objects)
-          (api-create-object (host-name i) 'master-1))
+          (api-create-host (host-name i) 'master-1))
         (dolist (node '(master-1 master-2))
           (iit-expect-log node (regexp-quote
                                 (format "Created and activated object '%s'" (last-host)))))
@@ -311,7 +348,7 @@ without a config file (\"ghost objects\", case A of Icinga/icinga2#11181)."
         (while (not (iit-node-reloaded-p 'master-2))
           ;; If this fails, master-2 took longer to reload than expected.
           (should (< num-deleted num-objects))
-          (api-delete-object (host-name num-deleted) 'master-1)
+          (api-delete-host (host-name num-deleted) 'master-1)
           (setq num-deleted (1+ num-deleted))
           (sleep-for 0.05))
         (message "Deleted %d hosts while master-2 was reloading" num-deleted)
