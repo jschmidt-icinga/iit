@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Icinga GmbH <https://icinga.com>
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 # Integration tests against an Icinga 2 source tree, only started manually: new tests are usually
 # expected to fail until the Icinga 2 changes they cover are merged.
 #

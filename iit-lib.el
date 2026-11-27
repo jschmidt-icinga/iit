@@ -1,5 +1,8 @@
 ;;; iit-lib.el --- Run Icinga 2 clusters in podman containers for ERT tests -*- lexical-binding: t -*-
 
+;; SPDX-FileCopyrightText: 2026 Icinga GmbH <https://icinga.com>
+;; SPDX-License-Identifier: GPL-3.0-or-later
+
 ;;; Commentary:
 
 ;; Infrastructure for integration tests that run against real Icinga 2 clusters.

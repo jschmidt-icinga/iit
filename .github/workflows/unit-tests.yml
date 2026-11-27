@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Icinga GmbH <https://icinga.com>
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 # Self-tests of the test infrastructure.  They need neither podman nor Icinga 2.
 name: Unit tests
 

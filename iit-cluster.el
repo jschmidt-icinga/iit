@@ -1,5 +1,8 @@
 ;;; iit-cluster.el --- Integration tests for Icinga 2 clusters -*- lexical-binding: t -*-
 
+;; SPDX-FileCopyrightText: 2026 Icinga GmbH <https://icinga.com>
+;; SPDX-License-Identifier: GPL-3.0-or-later
+
 ;;; Commentary:
 
 ;; Tests that run against real Icinga 2 clusters in podman containers, see iit-lib.el.  They are

@@ -1,6 +1,9 @@
 #!/usr/bin/env -S emacs -Q --script
 ;; -*- lexical-binding: t mode: emacs-lisp -*-
 
+;; SPDX-FileCopyrightText: 2026 Icinga GmbH <https://icinga.com>
+;; SPDX-License-Identifier: GPL-3.0-or-later
+
 ;; Command line interface for the Icinga 2 integration tests.
 ;;
 ;; Usage: ./iit.el [--source DIR] [--image NAME] [--skip-build] [--keep] [--verbose] [SELECTOR]
