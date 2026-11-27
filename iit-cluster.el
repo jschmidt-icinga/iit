@@ -117,6 +117,35 @@ They do nothing but make loading the config, and thus a reload, take longer."
                 forms))))
     (nreverse forms)))
 
+(defun zone-host-files (zone count)
+  "Return :files entries for zones.d/ZONE with COUNT hosts, one file per host."
+  (let (files)
+    (dotimes (i count)
+      (let ((host (format "zone-host-%d" i)))
+        (push `(,(format "zones.d/%s/hosts/%s.conf" zone host)
+                (object Host ,host (check_command "dummy") (enable_active_checks nil)))
+              files)))
+    (nreverse files)))
+
+(defun api-object-count (type node)
+  "Return the number of objects of TYPE (e.g. `host') in the memory of NODE."
+  (length (alist-get 'results (iit-api-request 'GET node (format "v1/objects/%ss?attrs=name"
+                                                                type)))))
+
+(defun config-update-sizes (node zone)
+  "Return the sizes of the config updates for ZONE that NODE applied.
+Only updates since NODE's log mark count.  The sizes are in bytes, oldest
+update first."
+  (let ((log (iit-node-log node))
+        (regexp (concat "Applying configuration file update for path '[^']*/"
+                        (regexp-quote zone) "' (\\([0-9]+\\) Bytes)"))
+        (start 0)
+        sizes)
+    (while (string-match regexp log start)
+      (push (string-to-number (match-string 1 log)) sizes)
+      (setq start (match-end 0)))
+    (nreverse sizes)))
+
 ;;;; Cluster tests
 
 (ert-deftest api-object-creation-consistent-delete ()
@@ -435,6 +464,71 @@ of Icinga/icinga2#11181)."
         (iit-node-reload 'master-2)
         (iit-expect-log 'master-2 iit-ready-regexp)
         (check-hosts 'master-2)))))
+
+(ert-deftest config-sync-during-activation ()
+  "Test that a master never syncs a partially copied zone config to a satellite.
+
+When a master has validated a zone config it received from the config master,
+it replaces its production zones directory with the new config file by file.
+Satellites that connect in the meantime get the config from that directory,
+which used to be read without waiting for the copy to finish.  So they got an
+incomplete config, but with the new timestamp, which is copied first.  They
+activated it, and then ignored the complete config with the same timestamp until
+the config changed again (Icinga/icinga2#11175)."
+  :tags '(:cluster)
+  ;; master-2 copies the zone config file by file and logs every file.  Throttling that log
+  ;; makes the copy take long enough for the satellite to start and connect: about 15 s, as the
+  ;; first few hundred files are copied without waiting.
+  (let ((num-hosts 2000))
+    (iit-with-cluster ((master-1 :zone "master"
+                                 :files ,(zone-host-files "satellite" num-hosts))
+                       (master-2 :zone "master"
+                                 :log-throttle ("Copying file '" 0.01))
+                       (satellite :parent "master")
+                       :start nil)
+      ;; master-2 gets the zone config from master-1, validates it and copies it into its
+      ;; production zones directory.
+      (iit-node-start 'master-1 'master-2)
+      (iit-expect-log 'master-2 (regexp-quote
+                                 "from endpoint 'master-1' are different to production"))
+
+      ;; The satellite must not get the zone config from master-1, which always sends a complete
+      ;; one.  If that one came first, the satellite would ignore the incomplete one from master-2,
+      ;; which has the same timestamp.
+      (iit-node-stop 'master-1)
+
+      ;; The satellite is started once master-2 has started copying, so that it connects while
+      ;; master-2's production zones directory is incomplete.
+      (iit-expect-log 'master-2 "Config validation for stage '[^']*' was OK, replacing into")
+      (iit-node-start 'satellite)
+      (iit-expect-log 'satellite "Received configuration updates ([0-9]+) from endpoint 'master-2'")
+
+      ;; Once master-2's new worker has taken over, the old one has written its complete log.
+      (iit-expect-log 'master-2 iit-ready-regexp 2)
+
+      ;; If this fails, the satellite connected too late (or too early) for the test to be
+      ;; meaningful: master-2 must still have copied many files after it started to sync the
+      ;; satellite.  A longer delay per file in :log-throttle makes the copy take longer.
+      (with-temp-buffer
+        (insert (iit-node-log 'master-2))
+        (goto-char (point-min))
+        (should (search-forward "Sending config updates for endpoint 'satellite'" nil t))
+        (let ((copied-before (how-many (regexp-quote "Copying file '") (point-min) (point)))
+              (copied-after (how-many (regexp-quote "Copying file '") (point) (point-max))))
+          (message "master-2 copied %d files before and %d after it started to sync the satellite"
+                   copied-before copied-after)
+          (should (> copied-before 0))
+          (should (> copied-after (/ num-hosts 10)))))
+
+      ;; The satellite must have got the same config as master-2.
+      (should (equal (car (config-update-sizes 'satellite "satellite"))
+                     (car (config-update-sizes 'master-2 "satellite"))))
+
+      ;; The satellite reloads with the config it got and then gets the complete config again from
+      ;; master-2, which it considers equal.  It must have all hosts then.
+      (iit-expect-log 'satellite iit-ready-regexp 2)
+      (iit-expect-log 'satellite (regexp-quote "from endpoint 'master-2' are equal to production"))
+      (should (= (api-object-count 'host 'satellite) num-hosts)))))
 
 (provide 'iit-cluster)
 ;;; iit-cluster.el ends here
