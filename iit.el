@@ -62,7 +62,5 @@
     (or selector t)))
 
 ;; With EMACS_TEST_JUNIT_REPORT set, ERT writes a JUnit report named after this file, iit.xml.
-(defvar ert-load-file-name)
-(setq ert-load-file-name load-file-name)
-
-(ert-run-tests-batch-and-exit (iit-parse-command-line command-line-args-left))
+(let ((ert-load-file-name load-file-name))
+  (ert-run-tests-batch-and-exit (iit-parse-command-line command-line-args-left)))
