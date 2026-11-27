@@ -24,6 +24,10 @@ on:
         description: "ERT selector: a regexp matching test names or a Lisp form like (tag :cluster). Empty runs all tests."
         required: false
         default: ''
+      unity-build:
+        description: Build Icinga 2 as a unity build (faster without cache, slower with it)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -65,6 +69,20 @@ jobs:
             sudo apparmor_parser -r "$profile"
           fi
 
+      # The Containerfile keeps ccache's files in a podman build cache mount, which is a plain
+      # directory on the host.  The cache entries can't be overwritten, so each run saves a new one
+      # and restores the newest.  ccache keeps its size below 5 GB, and GitHub removes the old
+      # entries once they take more than the repository's limit.
+      - name: Locate the podman build cache
+        run: echo "BUILDAH_CACHE=${TMPDIR:-/var/tmp}/buildah-cache-$(id -u)" >> "$GITHUB_ENV"
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.BUILDAH_CACHE }}
+          key: ccache-${{ github.run_id }}
+          restore-keys: ccache-
+
       - name: Show versions
         env:
           REPOSITORY: ${{ inputs.repository }}
@@ -80,11 +98,33 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run tests
+        id: tests
         working-directory: iit
         env:
           EMACS_TEST_JUNIT_REPORT: '1'
           SELECTOR: ${{ inputs.selector }}
-        run: ./iit.el --verbose ${SELECTOR:+"$SELECTOR"}
+          UNITY_BUILD: ${{ inputs.unity-build && 'ON' || 'OFF' }}
+        run: ./iit.el --verbose --build-arg "ICINGA2_UNITY_BUILD=$UNITY_BUILD" ${SELECTOR:+"$SELECTOR"}
+
+      # The CMake build directory is a cache mount as well, but not worth keeping: the checkout
+      # gives all sources a new modification time, so make recompiles everything anyway.
+      - name: Remove the CMake build directory from the cache
+        if: ${{ !cancelled() && steps.tests.outcome != 'skipped' }}
+        run: |
+          if [ ! -d "$BUILDAH_CACHE" ]; then
+            echo "::warning::$BUILDAH_CACHE doesn't exist, the build didn't use the expected cache location"
+            exit 0
+          fi
+          find "$BUILDAH_CACHE" -mindepth 2 -maxdepth 2 -name CMakeCache.txt -printf '%h\0' |
+            xargs -0 -r rm -rf
+          du -sh "$BUILDAH_CACHE"
+
+      - name: Save ccache
+        if: ${{ !cancelled() && steps.tests.outcome != 'skipped' }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.BUILDAH_CACHE }}
+          key: ccache-${{ github.run_id }}
 
       - name: Test report
         if: ${{ !cancelled() }}

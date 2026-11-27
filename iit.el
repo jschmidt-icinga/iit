@@ -6,7 +6,8 @@
 
 ;; Command line interface for the Icinga 2 integration tests.
 ;;
-;; Usage: ./iit.el [--source DIR] [--image NAME] [--skip-build] [--keep] [--verbose] [SELECTOR]
+;; Usage: ./iit.el [--source DIR] [--image NAME] [--build-arg ARG] [--skip-build] [--keep]
+;;                  [--verbose] [SELECTOR]
 ;;
 ;;   ./iit.el                                 build ../icinga2 and run all tests
 ;;   ./iit.el --source ~/icinga2 api-object   only tests matching a regexp
@@ -35,6 +36,8 @@
 
   --source DIR   Icinga 2 source tree (default: $ICINGA2_SOURCE or ../icinga2)
   --image NAME   image name to build and use
+  --build-arg NAME=VALUE
+                 build argument for the image, can be given more than once
   --skip-build   use the existing image instead of building it
   --keep         keep the containers of a failed test
   --verbose      log every podman command
@@ -44,11 +47,12 @@
     (while args
       (let ((arg (pop args)))
         (pcase arg
-          ((or "--source" "--image")
+          ((or "--source" "--image" "--build-arg")
            (let ((value (or (pop args) (error "%s needs an argument" arg))))
-             (if (equal arg "--source")
-                 (setq iit-icinga2-source (expand-file-name value))
-               (setq iit-image value))))
+             (pcase arg
+               ("--source" (setq iit-icinga2-source (expand-file-name value)))
+               ("--image" (setq iit-image value))
+               ("--build-arg" (setq iit-build-args (append iit-build-args (list value)))))))
           ("--skip-build" (setq iit-build-image nil))
           ("--keep" (setq iit-keep-on-failure t))
           ("--verbose" (setq iit-verbose t))
