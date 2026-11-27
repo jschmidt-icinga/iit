@@ -1,0 +1,80 @@
+# Integration tests against an Icinga 2 source tree, only started manually: new tests are usually
+# expected to fail until the Icinga 2 changes they cover are merged.
+#
+#   gh workflow run cluster-tests.yml -f ref=refs/pull/1234/head
+#   gh workflow run cluster-tests.yml --ref my-tests-branch -f repository=someone/icinga2 -f ref=fix-sync
+name: Cluster tests
+run-name: Cluster tests against ${{ inputs.repository }}@${{ inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: Icinga 2 repository
+        required: true
+        default: Icinga/icinga2
+      ref:
+        description: Icinga 2 branch, tag or full commit hash (refs/pull/N/head for a pull request)
+        required: true
+        default: master
+      selector:
+        description: "ERT selector: a regexp matching test names or a Lisp form like (tag :cluster). Empty runs all tests."
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  cluster-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Check out the tests
+        uses: actions/checkout@v5
+        with:
+          path: config-sync-tests
+
+      # tests.el uses ../icinga2 by default.
+      - name: Check out Icinga 2
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          path: icinga2
+          persist-credentials: false
+
+      - name: Install Emacs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends emacs-nox
+
+      - name: Show versions
+        env:
+          REPOSITORY: ${{ inputs.repository }}
+        run: |
+          emacs --version | head -n 1
+          podman version
+          {
+            echo "### Icinga 2 under test"
+            echo
+            echo "\`$REPOSITORY\` at \`$(git -C icinga2 rev-parse HEAD)\`"
+            echo
+            echo "$(git -C icinga2 log -1 --format='%s')"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run tests
+        working-directory: config-sync-tests
+        env:
+          EMACS_TEST_JUNIT_REPORT: '1'
+          SELECTOR: ${{ inputs.selector }}
+        run: ./tests.el --verbose ${SELECTOR:+"$SELECTOR"}
+
+      - name: Test report
+        if: ${{ !cancelled() }}
+        uses: mikepenz/action-junit-report@v5
+        with:
+          report_paths: config-sync-tests/tests.xml
+          annotate_only: true
+          detailed_summary: true
+          include_passed: true
