@@ -821,43 +821,9 @@ node names as symbols."
   (declare (indent 1) (debug (sexp body)))
   `(iit-call-with-cluster ,(list '\` spec) (lambda () ,@body)))
 
-;;;; Command line
-
-(defun iit-parse-command-line (args)
-  "Apply the options in ARGS and return the ERT selector given there.
-
-  --source DIR   Icinga 2 source tree (default: $ICINGA2_SOURCE or ../icinga2)
-  --image NAME   image name to build and use
-  --skip-build   use the existing image instead of building it
-  --keep         keep the containers of a failed test
-  --verbose      log every podman command
-  SELECTOR       ERT selector: a regexp matching test names, or a Lisp form
-                 like (tag :unit)"
-  (let (selector)
-    (while args
-      (let ((arg (pop args)))
-        (pcase arg
-          ((or "--source" "--image")
-           (let ((value (or (pop args) (error "%s needs an argument" arg))))
-             (if (equal arg "--source")
-                 (setq iit-icinga2-source (expand-file-name value))
-               (setq iit-image value))))
-          ("--skip-build" (setq iit-build-image nil))
-          ("--keep" (setq iit-keep-on-failure t))
-          ("--verbose" (setq iit-verbose t))
-          ((pred (string-prefix-p "--")) (error "Unknown option %s" arg))
-          (_
-           (when selector
-             (error "Only one test selector can be given"))
-           (setq selector (if (string-match-p "\\`\\(?:[(:]\\|t\\'\\)" arg)
-                              (car (read-from-string arg))
-                            arg))))))
-    (or selector t)))
-
 ;;;; Self-tests
 
-;; Unit tests of this file, which need neither podman nor Icinga 2.  iit.el runs them with
-;; the selector (tag :unit).
+;; Unit tests of this file, which need neither podman nor Icinga 2.  They are tagged :unit.
 
 (ert-deftest iit-config-render-object ()
   :tags '(:unit)
