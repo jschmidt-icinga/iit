@@ -317,12 +317,13 @@ See the commentary at the top of this file for why."
   nodes global-zones (start t) dir network)
 
 (cl-defstruct (iit-node (:constructor iit--make-node) (:copier nil))
-  name zone parent port features files mounts (log-mark 0) cached-address)
+  name zone parent port features files mounts log-throttle (log-mark 0) cached-address
+  throttle-process)
 
 (defvar iit-current-cluster nil
   "The cluster of the innermost `iit-with-cluster'.")
 
-(defconst iit--node-keys '(:zone :parent :port :features :files :mounts))
+(defconst iit--node-keys '(:zone :parent :port :features :files :mounts :log-throttle))
 (defconst iit--cluster-keys '(:global-zones :start))
 
 (defun iit--parse-node (spec)
@@ -337,7 +338,12 @@ See the commentary at the top of this file for why."
     (cl-loop for key in plist by #'cddr
              unless (memq key iit--node-keys)
              do (error "Unknown option %S for node %s" key name))
-    (let ((name (format "%s" name)))
+    (let ((name (format "%s" name))
+          (log-throttle (plist-get plist :log-throttle)))
+      (unless (or (null log-throttle)
+                  (pcase log-throttle
+                    (`(,(pred stringp) ,(pred numberp)) t)))
+        (error ":log-throttle of node %s must be (REGEXP SECONDS)" name))
       (iit--make-node
        :name name
        :zone (format "%s" (or (plist-get plist :zone) name))
@@ -347,7 +353,8 @@ See the commentary at the top of this file for why."
                      (plist-get plist :features)
                    iit-default-features)
        :files (plist-get plist :files)
-       :mounts (plist-get plist :mounts)))))
+       :mounts (plist-get plist :mounts)
+       :log-throttle log-throttle))))
 
 (defun iit-parse-cluster-spec (spec)
   "Parse the cluster SPEC of `iit-with-cluster' into a `iit-cluster'."
@@ -398,6 +405,53 @@ See the commentary at the top of this file for why."
         (unless (assoc parent zones)
           (error "Parent zone %s of zone %s has no nodes" parent (car zone)))))
     zones))
+
+;;;; Log throttling
+
+;; A node with :log-throttle (REGEXP SECONDS) gets an additional FileLogger that writes into a
+;; FIFO in its log directory.  A reader on the host reads the FIFO line by line and sleeps for
+;; SECONDS after each line that matches REGEXP.  Once the FIFO's buffer is full, writing to the
+;; logger blocks, so Icinga 2 can't log matching lines faster than that.  Code that logs every
+;; step, like copying a file, can only proceed at that pace then.
+;;
+;; The FIFO's buffer (usually 64 KiB) and the logger's stream buffer allow several hundred lines
+;; to be logged without waiting first.  Other threads that log at the same time wait for the
+;; logger as well.
+
+(defconst iit--log-throttle-fifo "log/log-throttle.fifo"
+  "The FIFO of a node with :log-throttle, relative to `iit-node-dir'.")
+
+(defconst iit--log-throttle-script "\
+exec 3<>\"$1\"
+while IFS= read -r line <&3; do
+  if [[ $line =~ $2 ]]; then
+    sleep \"$3\"
+  fi
+done"
+  "Bash script that reads the FIFO $1 and sleeps $3 seconds per line matching $2.
+The FIFO is opened for writing as well, so that the script doesn't get an end of
+file when Icinga 2 restarts.  Bash's read reads a FIFO byte by byte, so nothing
+is read ahead.")
+
+(defun iit--start-log-throttle (node)
+  "Create the FIFO of NODE's :log-throttle and start reading it."
+  (pcase-let ((`(,regexp ,seconds) (iit-node-log-throttle node))
+              (fifo (iit-node-dir node iit--log-throttle-fifo)))
+    (unless (eql 0 (call-process "mkfifo" nil nil nil fifo))
+      (error "Could not create %s" fifo))
+    (setf (iit-node-throttle-process node)
+          (make-process :name (concat "iit-log-throttle-" (iit-node-name node))
+                        :command (list "bash" "-c" iit--log-throttle-script "iit-log-throttle"
+                                       fifo regexp (number-to-string seconds))
+                        :connection-type 'pipe
+                        :noquery t
+                        :sentinel #'ignore))))
+
+(defun iit--stop-log-throttle (node)
+  "Stop reading the FIFO of NODE's :log-throttle."
+  (when-let* ((process (iit-node-throttle-process node)))
+    (delete-process process)
+    (setf (iit-node-throttle-process node) nil)))
 
 ;;;; Generated config
 
@@ -450,6 +504,13 @@ Files from the node's :files come last and take precedence."
                                  (error "Unknown feature %S for node %s"
                                         feature (iit-node-name node))))))
               (iit-node-features node))
+    ,@(when (iit-node-log-throttle node)
+        `(("features-enabled/log-throttle.conf"
+           . ,(iit-config-render
+               `(object FileLogger "log-throttle"
+                        (severity "information")
+                        (path (raw ,(format "LogDir + \"/%s\""
+                                            (file-name-nondirectory iit--log-throttle-fifo)))))))))
     ,@(mapcar (pcase-lambda (`(,path . ,forms))
                 (cons path (apply #'iit-config-render forms)))
               (iit-node-files node))))
@@ -750,7 +811,9 @@ A relative HOST path is relative to the node's directory and created if needed."
         (file-name-as-directory (make-temp-file "iit-" t)))
   (message "Setting up cluster in %s" (iit-cluster-dir cluster))
   (dolist (node (iit-cluster-nodes cluster))
-    (iit--write-node-config cluster node))
+    (iit--write-node-config cluster node)
+    (when (iit-node-log-throttle node)
+      (iit--start-log-throttle node)))
   (iit--generate-certificates cluster)
   (message "Creating network and containers")
   (iit-podman "network" "create" "--label" iit-label (iit-cluster-network cluster))
@@ -761,6 +824,8 @@ A relative HOST path is relative to the node's directory and created if needed."
   "Remove everything belonging to CLUSTER, keeping some of it if not OK."
   (let ((nodes (iit-cluster-nodes cluster))
         (dir (iit-cluster-dir cluster)))
+    ;; Kept containers with a throttled log stop once the FIFO is full.
+    (mapc #'iit--stop-log-throttle nodes)
     (if (and (not ok) iit-keep-on-failure)
         (message "Keeping containers %s"
                  (string-join (mapcar #'iit-node-container nodes) ", "))
@@ -812,6 +877,10 @@ A node spec is NAME or (NAME . OPTIONS) with these options:
                    They replace generated files with the same PATH.
   :mounts MOUNTS   extra bind mounts as (HOST CONTAINER [OPTIONS]); a relative
                    HOST is below `iit-node-dir'
+  :log-throttle (REGEXP SECONDS)
+                   make Icinga 2 wait SECONDS after logging a line matching
+                   REGEXP, a bash (POSIX extended) regexp; see the
+                   \"Log throttling\" section of iit-lib.el
 
 Cluster options:
 
@@ -916,7 +985,9 @@ apply Notification \"mail\" to Host {
   (should-error (iit-parse-cluster-spec '(master-1 master-1)))
   (should-error (iit-parse-cluster-spec '((sat-1 :parent "master"))))
   (should-error (iit-parse-cluster-spec '((a :zone "z" :parent "x") (b :zone "z" :parent "y") x y)))
-  (should-error (iit-parse-cluster-spec '(master-1 :bogus t))))
+  (should-error (iit-parse-cluster-spec '(master-1 :bogus t)))
+  (should-error (iit-parse-cluster-spec '((master-1 :log-throttle ("Copying" "1")))))
+  (should-error (iit-parse-cluster-spec '((master-1 :log-throttle "Copying")))))
 
 (ert-deftest iit-node-config-files ()
   :tags '(:unit)
@@ -935,6 +1006,14 @@ apply Notification \"mail\" to Host {
                    "object Host \"h1\" {\n  check_command = \"dummy\"\n}\n"))
     ;; Later entries win when the files are written.
     (should (equal (cdr (car (last files))) "// replaced\n")))
+  (let* ((cluster (iit-parse-cluster-spec '((m :log-throttle ("Copying file" 0.01)))))
+         (files (iit--node-config-files cluster (car (iit-cluster-nodes cluster)))))
+    (should (equal (cdr (assoc "features-enabled/log-throttle.conf" files))
+                   "object FileLogger \"log-throttle\" {
+  severity = \"information\"
+  path = LogDir + \"/log-throttle.fifo\"
+}
+")))
   (let ((cluster (iit-parse-cluster-spec '((m :features (nonexistent))))))
     (should-error (iit--node-config-files cluster (car (iit-cluster-nodes cluster))))))
 
