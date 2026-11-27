@@ -52,6 +52,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends emacs-nox
 
+      # When the last container on a network stops, podman sends SIGTERM to the pasta process of the
+      # rootless network namespace.  The AppArmor profile of pasta on Ubuntu 26.04 doesn't allow it
+      # to receive signals from podman, so podman fails with "rootless netns: kill network process:
+      # permission denied".  Add the missing rule unless the profile already has a signal rule.
+      - name: Allow podman to stop pasta
+        run: |
+          profile=/etc/apparmor.d/usr.bin.pasta
+          if [ -f "$profile" ] && ! grep -q 'signal' "$profile"; then
+            sudo sed -i 's/^}$/  signal (receive) set=(term) peer=podman,\n}/' "$profile"
+            grep -q 'peer=podman' "$profile"
+            sudo apparmor_parser -r "$profile"
+          fi
+
       - name: Show versions
         env:
           REPOSITORY: ${{ inputs.repository }}
