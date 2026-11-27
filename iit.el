@@ -369,6 +369,92 @@ without a config file (\"ghost objects\", case A of Icinga/icinga2#11181)."
         (check-hosts 'master-1)
         (check-hosts 'master-2)))))
 
+(ert-deftest api-object-create-and-delete-during-reload ()
+  "Test that objects created and deleted while a master reloads leave no files behind.
+
+While a node reloads, its old worker keeps applying config updates from the
+cluster, but the new worker has already read its config and doesn't see them.
+An object created in that window gets a config file but doesn't exist in the
+memory of the new worker.  When the new worker then gets the deletion, there is
+no object to delete, so the file used to stay behind.  The deleted object then
+came back at the next reload (case B of Icinga/icinga2#11181).  If it was a
+service whose host was deleted, the next reload failed validation instead
+\(case C)."
+  :tags '(:cluster)
+  (iit-with-cluster ((master-1 :zone "master")
+                     ;; The large config makes master-2 take long enough to reload that many
+                     ;; services are created and deleted during the reload.
+                     (master-2 :zone "master"
+                               :files (("conf.d/load.conf" ,@(load-config 5000 30)))))
+    (let ((num-hosts 300)
+          ;; Each service is deleted this many iterations of the loop below after it was created,
+          ;; which is about one to two seconds.
+          (delete-lag 20)
+          (num-created 0)
+          (num-deleted 0))
+      (cl-labels ((host-name (i)
+                    (format "test-host-%d" i))
+                  (last-host ()
+                    (host-name (1- num-hosts)))
+                  (delete-next-service ()
+                    (api-delete-service (host-name num-deleted) "test-service" 'master-1)
+                    (setq num-deleted (1+ num-deleted)))
+                  (check-no-test-objects (node)
+                    ;; Neither the hosts nor their services may exist, in memory or as config files.
+                    (dotimes (i num-hosts)
+                      (should-not (api-host-exists-p (host-name i) node))
+                      (should-not (api-service-exists-p (host-name i) "test-service" node)))
+                    (should-not (directory-files (api-hosts-dir node) nil "^test-host-"))
+                    (should-not (directory-files (api-services-dir node) nil "^test-host-"))))
+        ;; We create a number of host objects on master-1 and wait until both masters have them.
+        (iit-log-mark)
+        (dotimes (i num-hosts)
+          (api-create-host (host-name i) 'master-1))
+        (dolist (node '(master-1 master-2))
+          (iit-expect-log node (regexp-quote
+                                (format "Created and activated object '%s'" (last-host)))))
+
+        ;; Now we make master-2 reload and, until master-2's new worker has taken over, keep
+        ;; creating a service on master-1 and deleting it again a little later.  Some services are
+        ;; created by master-2's old worker after the new worker has already read its config, and
+        ;; then deleted on the new worker.
+        (iit-node-reload 'master-2)
+        (while (not (iit-node-reloaded-p 'master-2))
+          ;; If this fails, master-2 took longer to reload than expected.
+          (should (< num-created num-hosts))
+          (api-create-service (host-name num-created) "test-service" 'master-1)
+          (setq num-created (1+ num-created))
+          (when (>= num-created delete-lag)
+            (delete-next-service))
+          (sleep-for 0.05))
+        (message "Created %d services while master-2 was reloading" num-created)
+
+        ;; If this fails, master-2 reloaded too fast for the test to be meaningful.
+        (should (>= (- num-created delete-lag) 20))
+
+        ;; Once master-2 has reconnected, we delete the remaining services, and then all hosts.
+        (iit-expect-log 'master-1 (regexp-quote "Finished syncing endpoint 'master-2'"))
+        (iit-expect-log 'master-2 (regexp-quote
+                                   "Finished syncing runtime objects to endpoint 'master-1'."))
+        (while (< num-deleted num-created)
+          (delete-next-service))
+        (iit-log-mark)
+        (dotimes (i num-hosts)
+          (api-delete-host (host-name i) 'master-1))
+        (dolist (node '(master-1 master-2))
+          (iit-expect-log node (regexp-quote
+                                (format "Deleted object '%s' of type 'Host'" (last-host)))))
+
+        ;; Check that none of the hosts and services are left on either master.  Leftover service
+        ;; files are what makes them come back (case B) or break the config (case C).
+        (check-no-test-objects 'master-1)
+        (check-no-test-objects 'master-2)
+
+        ;; Finally, master-2 must still be able to reload, and no deleted objects may come back.
+        (iit-node-reload 'master-2)
+        (iit-expect-log 'master-2 iit-ready-regexp)
+        (check-no-test-objects 'master-2)))))
+
 ;; With EMACS_TEST_JUNIT_REPORT set, ERT writes a JUnit report to iit.xml.  It finds this file
 ;; through `load-history', which Emacs only updates once the file is completely loaded.
 (when load-file-name
